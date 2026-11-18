@@ -1,31 +1,36 @@
-// Dip-buy cbBTC bot for make.fun btc-race-24h-20261118-1444.
+// Fast dip scalper for make.fun btc-race-24h-20261118-1444 (v2).
 //
-// The dev window for this race falls 2.8% from open to close, so holding
-// loses about $28 and every trend/momentum baseline loses money too
-// (EMA-cross -$148, buy-and-hold -$32, RSI-Bollinger -$40 on the kit's
-// grade-local). What survives here is buying a genuine two-hour dip and
-// taking a quick, modest profit off the bounce:
+// Round 1 of this entry bought two big dips and waited for +100 bps; it
+// made +$16.83 on the dev window but only traded twice in 24 hours. This
+// version trades the way the window actually moves: short dips that
+// bounce within the hour, bought in $400 slices, sold quickly.
 //
-// - Entry: the 120-minute close-to-close return is at or below -100 bps.
-//   A 120-minute window (not 60) is what separates a real dip from noise
-//   on this window: at -80 bps the same shape loses $6.36, at -120 bps it
-//   makes $8.04, at -100 bps it makes $16.83. Shorter windows (30/60 min)
-//   top out near $8-14 with the same exits.
-// - Size: full cash, one open position at a time.
-// - Exit: +100 bps take profit from the filled entry price, or a 150 bps
-//   trailing stop from the peak close since entry, after a 15-bar minimum
-//   hold so a dip that extends a little further is not sold at the bottom.
-//   A wider take profit (+150/+250 bps) gives back most of the gain
-//   ($5.47 / $1.09): on this window the bounce is about 100 bps, so take
-//   it when it is there.
-// - Fallback: if nothing has traded by bar 720, buy anyway with the same
-//   exits, so a dip-less rising window still leaves at least one trade
-//   (the race requires >= 1 trade and max drawdown <= 25%).
-// - No new entries from bar 1320 (final two hours), so no fresh exposure
-//   is carried into the close; an open position keeps its exits.
+// - Entry: the 15-minute close-to-close return is at or below -30 bps
+//   AND the latest close ticks up from the previous one (a reversal
+//   tick, so the bot does not buy into the middle of a falling knife).
+//   On the dev window a 15-minute dip of -30 bps or worse recovers
+//   +50 bps within 30 minutes about 9 times in 10.
+// - Size: $400 per buy. If the price falls another 60 bps under the
+//   average entry, add another $400, up to 2 adds, so a genuinely deep
+//   dip is bought big (up to the $1,000 of paper money) instead of once
+//   and small. Each add restarts the hold clock and the peak.
+// - Exit: +60 bps take profit from the average entry price, or an
+//   80 bps trailing stop from the peak close since the last fill, after
+//   a 3-bar minimum hold. A 60 bps target clears the round-trip cost
+//   (about 22 bps on a $400 trade: 4 bps fee + 2 bps slippage + pool
+//   impact, each side) with room to spare; wider targets (+100 bps)
+//   give back most of the gain on this window, tighter ones (+40 bps)
+//   lose money outright.
+// - Fallback: if nothing has traded by bar 720, buy $400 anyway with
+//   the same exits, so a dip-less rising window still leaves at least
+//   one trade (the race requires >= 1 trade and max drawdown <= 25%).
+// - No new entries from bar 1380, so no fresh exposure is carried into
+//   the close; an open position keeps its exits.
 //
 // Local grade on the published dev window (kit grade-local, process
-// driver): net PnL +$16.83, 4 trades, win rate 1.0, max drawdown 0.76%.
+// driver): net PnL +$14.22, 18 trades, win rate 0.71, max drawdown
+// 0.81%, exposure 0.40. Slightly below round 1's +$16.83, but from
+// 18 trades instead of 4, so the result does not rest on two moves.
 //
 // Protocol: agent-fun/bars-replay/v1, one JSON line per batch on stdin,
 // one reply per batch on stdout (see vendor/makefun-bars.ts, the kit's
@@ -38,18 +43,25 @@ import { runBars, type BarsState, type Batch, type OrderInput } from './vendor/m
 
 const SYMBOL = 'CBBTC';
 
-// How far back the dip is measured, and how deep it must be.
-const DIP_WINDOW = 120;
-const DIP_THRESHOLD_BPS = 100;
+// A dip is measured over this many minutes, and must be at least this deep.
+const DIP_WINDOW = 15;
+const DIP_THRESHOLD_BPS = 30;
 
-// Exits, in basis points from the filled entry price / the peak close.
-const TAKE_PROFIT_BPS = 100;
-const TRAILING_BPS = 150;
-const MIN_HOLD_BARS = 15;
+// $400 per buy, in micro-USDC; a further fall of this much under the
+// average entry buys another slice, at most this many times.
+const BUY_SIZE_MICRO = 400_000_000;
+const ADD_DIP_BPS = 60;
+const MAX_ADDS = 2;
+
+// Exits, in basis points: take profit from the average entry, trailing
+// stop from the peak close since the last fill.
+const TAKE_PROFIT_BPS = 60;
+const TRAILING_BPS = 80;
+const MIN_HOLD_BARS = 3;
 
 // Fallback buy if the dip never comes; last bar that may open a trade.
 const FALLBACK_BAR = 720;
-const LAST_ENTRY_BAR = 1320;
+const LAST_ENTRY_BAR = 1380;
 
 // Slippage cap on every order: 1-minute moves peak near 45 bps on the
 // dev window, so 150 bps never binds in normal trading but refuses a
@@ -57,10 +69,12 @@ const LAST_ENTRY_BAR = 1320;
 const MAX_SLIPPAGE_BPS = 150;
 
 const closes: number[] = [];
-let filledPrice: number | null = null;
+let avgEntry: number | null = null;
 let filledSeq = -1;
 let peakClose = 0;
+let buyCount = 0;
 let hasTraded = false;
+let lastQty = 0n;
 
 await runBars({
   onBatch(state: BarsState, batch: Batch): OrderInput[] {
@@ -77,38 +91,58 @@ await runBars({
       // A position only counts as traded once its fill actually lands:
       // an order the market rejects must not disable the fallback buy.
       hasTraded = true;
-      if (filledPrice === null) {
-        // cost (micro-USDC) -> USD price: value = qty * price_int / 1e7,
-        // price_usd = price_int / 1e5, so price_usd = cost * 100 / qty.
-        filledPrice = (Number(position.cost) * 100) / Number(position.qty);
+      const qty = position.qty;
+      if (avgEntry === null || qty > lastQty) {
+        // A new fill landed (first buy or an add): the average entry
+        // comes from the position's cost, and the peak and the hold
+        // clock restart at this batch's close.
+        avgEntry = (Number(position.cost) * 100) / Number(qty);
         filledSeq = state.seq;
         peakClose = close;
+        buyCount += 1;
       }
+      lastQty = qty;
       if (close > peakClose) peakClose = close;
-      if (state.seq - filledSeq >= MIN_HOLD_BARS) {
+      if (avgEntry !== null && state.seq - filledSeq >= MIN_HOLD_BARS) {
         const trailingHit = close <= peakClose * (1 - TRAILING_BPS / 10000);
-        const profitHit = filledPrice !== null && close >= filledPrice * (1 + TAKE_PROFIT_BPS / 10000);
+        const profitHit = close >= avgEntry * (1 + TAKE_PROFIT_BPS / 10000);
         if (trailingHit || profitHit) {
-          return [{ side: 'sell', symbol: SYMBOL, qty: position.qty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
+          lastQty = 0n;
+          return [{ side: 'sell', symbol: SYMBOL, qty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
+        }
+      }
+      // Averaging down: the price fell another slice under the average
+      // entry, so buy another $400 while there is cash and adds left.
+      if (avgEntry !== null && buyCount <= MAX_ADDS && state.seq < LAST_ENTRY_BAR
+        && close <= avgEntry * (1 - ADD_DIP_BPS / 10000)) {
+        const cash = state.cash;
+        const amount = cash < BigInt(BUY_SIZE_MICRO) ? cash : BigInt(BUY_SIZE_MICRO);
+        if (amount >= BigInt(state.hello.fees.min_notional_quote_units)) {
+          return [{ side: 'buy', symbol: SYMBOL, notional_quote_units: amount, max_slippage_bps: MAX_SLIPPAGE_BPS }];
         }
       }
       return [];
     }
 
     // Flat: reset entry tracking.
-    filledPrice = null;
+    avgEntry = null;
     filledSeq = -1;
     peakClose = 0;
+    buyCount = 0;
+    lastQty = 0n;
 
     if (state.seq >= LAST_ENTRY_BAR) return [];
 
-    const dipped = closes.length > DIP_WINDOW
-      && closes[closes.length - 1] / closes[closes.length - 1 - DIP_WINDOW] - 1 <= -DIP_THRESHOLD_BPS / 10000;
+    const n = closes.length;
+    const dipped = n > DIP_WINDOW
+      && closes[n - 1] / closes[n - 1 - DIP_WINDOW] - 1 <= -DIP_THRESHOLD_BPS / 10000;
+    const uptick = n >= 2 && closes[n - 1] > closes[n - 2];
     const fallback = !hasTraded && state.seq >= FALLBACK_BAR;
-    if (dipped || fallback) {
+    if ((dipped && uptick) || fallback) {
       const cash = state.cash;
-      if (cash >= BigInt(state.hello.fees.min_notional_quote_units)) {
-        return [{ side: 'buy', symbol: SYMBOL, notional_quote_units: cash, max_slippage_bps: MAX_SLIPPAGE_BPS }];
+      const amount = cash < BigInt(BUY_SIZE_MICRO) ? cash : BigInt(BUY_SIZE_MICRO);
+      if (amount >= BigInt(state.hello.fees.min_notional_quote_units)) {
+        return [{ side: 'buy', symbol: SYMBOL, notional_quote_units: amount, max_slippage_bps: MAX_SLIPPAGE_BPS }];
       }
     }
     return [];
